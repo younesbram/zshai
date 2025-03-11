@@ -6,13 +6,16 @@ SUGGEST_KEY='^H'  # Ctrl+H
 EXPLAIN_KEY='^E'  # Ctrl+E
 GROQ_MODEL="llama-3.1-8b-instant"
 GPT4O_MODEL="gpt-4o-2024-08-06"
+CLAUDE_MODEL="claude-3-7-sonnet-20250219"
 GROQ_API_KEY=${GROQ_API_KEY:-""}
 OPENAI_API_KEY=${OPENAI_API_KEY:-""}
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-""}
 STREAMING_ENABLED=false  # Set to false to disable typewriter effect
 
 # Variables to store previous suggestions
 PREV_GROQ_SUGGESTIONS=""
 PREV_GPT4O_SUGGESTIONS=""
+PREV_CLAUDE_SUGGESTIONS=""
 
 # Dependency check
 if ! command -v jq >/dev/null 2>&1; then
@@ -25,9 +28,9 @@ if ! command -v fzf >/dev/null 2>&1; then
 fi
 
 # API key check
-if [[ -z "$GROQ_API_KEY" || -z "$OPENAI_API_KEY" ]]; then
-  echo "Error: Please set GROQ_API_KEY and OPENAI_API_KEY in your environment."
-  echo "Example: export GROQ_API_KEY='your_groq_key' && export OPENAI_API_KEY='your_openai_key'"
+if [[ -z "$GROQ_API_KEY" || -z "$OPENAI_API_KEY" || -z "$ANTHROPIC_API_KEY" ]]; then
+  echo "Error: Please set GROQ_API_KEY, OPENAI_API_KEY, and ANTHROPIC_API_KEY in your environment."
+  echo "Example: export GROQ_API_KEY='your_groq_key' && export OPENAI_API_KEY='your_openai_key' && export ANTHROPIC_API_KEY='your_anthropic_key'"
   return 1
 fi
 
@@ -73,6 +76,7 @@ suggest_ai() {
   # Clear previous suggestions when starting a new session
   PREV_GROQ_SUGGESTIONS=""
   PREV_GPT4O_SUGGESTIONS=""
+  PREV_CLAUDE_SUGGESTIONS=""
   
   # Get FZF-style history matches first (just like ctrl-r behavior)
   if [[ -n "$buffer" ]]; then
@@ -85,6 +89,7 @@ suggest_ai() {
   # Now add refresh options at the BOTTOM
   echo "Refresh with Llama-8b-instant" >> "$temp_file"
   echo "Refresh with GPT-4o" >> "$temp_file"
+  echo "Refresh with Claude" >> "$temp_file"
   
   # Present initial suggestions - just like ctrl-r
   local selection=$(cat "$temp_file" | fzf --height=15 --prompt="Pick a command> " --reverse)
@@ -97,6 +102,10 @@ suggest_ai() {
     elif [[ "$selection" == "Refresh with Llama-8b-instant" ]]; then
       rm -f "$temp_file" 2>/dev/null
       refresh_groq
+      return
+    elif [[ "$selection" == "Refresh with Claude" ]]; then
+      rm -f "$temp_file" 2>/dev/null
+      refresh_claude
       return
     else
       BUFFER="$selection"
@@ -157,6 +166,7 @@ EOL
   # Add refresh options at the BOTTOM
   echo "Refresh with Llama-8b-instant" >> "$temp_file"
   echo "Refresh with GPT-4o" >> "$temp_file"
+  echo "Refresh with Claude" >> "$temp_file"
   
   # Present all suggestions
   local selection=$(cat "$temp_file" | fzf --height=15 --prompt="Llama suggestions> " --reverse)
@@ -170,6 +180,10 @@ EOL
     elif [[ "$selection" == "Refresh with Llama-8b-instant" ]]; then
       rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
       refresh_groq
+      return
+    elif [[ "$selection" == "Refresh with Claude" ]]; then
+      rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+      refresh_claude
       return
     else
       BUFFER="$selection"
@@ -231,6 +245,7 @@ EOL
   # Add refresh options at the BOTTOM
   echo "Refresh with Llama-8b-instant" >> "$temp_file"
   echo "Refresh with GPT-4o" >> "$temp_file"
+  echo "Refresh with Claude" >> "$temp_file"
   
   # Present all suggestions
   local selection=$(cat "$temp_file" | fzf --height=15 --prompt="GPT-4o suggestions> " --reverse)
@@ -244,6 +259,89 @@ EOL
     elif [[ "$selection" == "Refresh with Llama-8b-instant" ]]; then
       rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
       refresh_groq
+      return
+    elif [[ "$selection" == "Refresh with Claude" ]]; then
+      rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+      refresh_claude
+      return
+    else
+      BUFFER="$selection"
+      CURSOR=${#BUFFER}
+    fi
+  fi
+  
+  # Clean up
+  rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+  zle redisplay
+}
+
+# Claude refresh with full context
+refresh_claude() {
+  local buffer="$BUFFER"
+  local temp_file=$(mktemp)
+  local json_file=$(mktemp)
+  
+  # First get FZF-style history matches (just like ctrl-r)
+  if [[ -n "$buffer" ]]; then
+    get_history_matches "$buffer" 15 > "$temp_file"
+  else
+    # If buffer is empty, show recent commands
+    fc -ln 1 | tail -n 15 | sort -u > "$temp_file"
+  fi
+  
+  # Build the do-not-suggest list
+  local avoid_list=""
+  if [[ -n "$PREV_CLAUDE_SUGGESTIONS" ]]; then
+    avoid_list="DO NOT suggest these previous commands: $PREV_CLAUDE_SUGGESTIONS"
+  fi
+  
+  # Escape buffer for JSON
+  local escaped_buffer=$(echo "$buffer" | sed 's/"/\\"/g')
+  
+  # Create a sanitized API payload - explicitly asking for FULL commands
+  cat > "$json_file" << EOL
+{"model": "$CLAUDE_MODEL", "messages": [{"role": "user", "content": "Generate 8 realistic shell commands starting with '$escaped_buffer'. Include multiple arguments and full commands. $avoid_list Return ONLY a JSON array format: {\"suggestions\":[\"$escaped_buffer command1\",\"$escaped_buffer command2\",...]}. Make sure each suggestion is a complete, runnable command that starts with '$escaped_buffer'."}], "max_tokens": 900}
+EOL
+  
+  # Make API call
+  local result_file=$(mktemp)
+  curl -s -m 5 https://api.anthropic.com/v1/messages \
+    -H "x-api-key: $ANTHROPIC_API_KEY" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "Content-Type: application/json" \
+    -d @"$json_file" 2>/dev/null | 
+    jq -r '.content[0].text' 2>/dev/null | 
+    jq -r '.suggestions[]' 2>/dev/null > "$result_file"
+  
+  # Save suggestions for next refresh
+  PREV_CLAUDE_SUGGESTIONS=$(cat "$result_file" | tr '\n' ',' | sed 's/,$//')
+  
+  # Append results to temp file
+  if [[ -s "$result_file" ]]; then
+    cat "$result_file" >> "$temp_file"
+  fi
+  
+  # Add refresh options at the BOTTOM
+  echo "Refresh with Llama-8b-instant" >> "$temp_file"
+  echo "Refresh with GPT-4o" >> "$temp_file"
+  echo "Refresh with Claude" >> "$temp_file"
+  
+  # Present all suggestions
+  local selection=$(cat "$temp_file" | fzf --height=15 --prompt="Claude suggestions> " --reverse)
+  
+  # Handle selection
+  if [[ -n "$selection" ]]; then
+    if [[ "$selection" == "Refresh with GPT-4o" ]]; then
+      rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+      refresh_gpt4o
+      return
+    elif [[ "$selection" == "Refresh with Llama-8b-instant" ]]; then
+      rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+      refresh_groq
+      return
+    elif [[ "$selection" == "Refresh with Claude" ]]; then
+      rm -f "$temp_file" "$json_file" "$result_file" 2>/dev/null
+      refresh_claude
       return
     else
       BUFFER="$selection"
